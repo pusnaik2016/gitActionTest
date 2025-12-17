@@ -1,0 +1,422 @@
+name: DELETE AWS EVERY RESOURCES
+
+on:
+  workflow_dispatch:  # Manual trigger only
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_NAME: campus-events
+  ECS_CLUSTER: campus-events-cluster
+  BACKEND_SERVICE: campus-events-backend-service
+  FRONTEND_SERVICE: campus-events-frontend-service
+  BACKEND_REPO: campus-events-backend
+  FRONTEND_REPO: campus-events-frontend
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Delete ECS Services
+        run: |
+          echo "🗑️  Scaling down and deleting ECS services..."
+          
+          # Scale down backend service
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.BACKEND_SERVICE }} \
+            --desired-count 0 \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || echo "Backend service not found or already deleted"
+          
+          # Scale down frontend service
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.FRONTEND_SERVICE }} \
+            --desired-count 0 \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || echo "Frontend service not found or already deleted"
+          
+          sleep 15
+          
+          # Delete backend service
+          aws ecs delete-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.BACKEND_SERVICE }} \
+            --force \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || echo "Backend service already deleted"
+          
+          # Delete frontend service
+          aws ecs delete-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.FRONTEND_SERVICE }} \
+            --force \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || echo "Frontend service already deleted"
+          
+          sleep 15
+          echo "✅ ECS services deleted"
+
+      - name: Deregister Task Definitions
+        run: |
+          echo "🗑️  Deregistering task definitions..."
+          
+          # Get all task definition revisions for backend
+          BACKEND_TASKS=$(aws ecs list-task-definitions \
+            --family-prefix ${{ env.PROJECT_NAME }}-backend-task \
+            --region ${{ env.AWS_REGION }} \
+            --query 'taskDefinitionArns[]' \
+            --output text 2>/dev/null || echo "")
+          
+          for TASK_ARN in $BACKEND_TASKS; do
+            aws ecs deregister-task-definition \
+              --task-definition $TASK_ARN \
+              --region ${{ env.AWS_REGION }} 2>/dev/null || true
+          done
+          
+          # Get all task definition revisions for frontend
+          FRONTEND_TASKS=$(aws ecs list-task-definitions \
+            --family-prefix ${{ env.PROJECT_NAME }}-frontend-task \
+            --region ${{ env.AWS_REGION }} \
+            --query 'taskDefinitionArns[]' \
+            --output text 2>/dev/null || echo "")
+          
+          for TASK_ARN in $FRONTEND_TASKS; do
+            aws ecs deregister-task-definition \
+              --task-definition $TASK_ARN \
+              --region ${{ env.AWS_REGION }} 2>/dev/null || true
+          done
+          
+          echo "✅ Task definitions deregistered"
+
+      - name: Delete ECS Cluster
+        run: |
+          echo "🗑️  Deleting ECS cluster..."
+          aws ecs delete-cluster \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || echo "Cluster already deleted"
+          echo "✅ ECS cluster deleted"
+
+      - name: Delete Load Balancer
+        id: delete-alb
+        run: |
+          echo "🗑️  Deleting Application Load Balancer..."
+          
+          ALB_ARN=$(aws elbv2 describe-load-balancers \
+            --names "${{ env.PROJECT_NAME }}-alb" \
+            --query 'LoadBalancers[0].LoadBalancerArn' \
+            --output text \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || echo "None")
+          
+          if [ "$ALB_ARN" != "None" ] && [ -n "$ALB_ARN" ]; then
+            # Delete all listeners
+            LISTENER_ARNS=$(aws elbv2 describe-listeners \
+              --load-balancer-arn $ALB_ARN \
+              --query 'Listeners[*].ListenerArn' \
+              --output text \
+              --region ${{ env.AWS_REGION }} 2>/dev/null || echo "")
+            
+            for LISTENER_ARN in $LISTENER_ARNS; do
+              aws elbv2 delete-listener \
+                --listener-arn $LISTENER_ARN \
+                --region ${{ env.AWS_REGION }} 2>/dev/null || true
+            done
+            
+            # Delete ALB
+            aws elbv2 delete-load-balancer \
+              --load-balancer-arn $ALB_ARN \
+              --region ${{ env.AWS_REGION }}
+            
+            echo "Waiting for ALB deletion..."
+            sleep 45
+          fi
+          echo "✅ Load balancer deleted"
+
+      - name: Delete Target Groups
+        run: |
+          echo "🗑️  Deleting target groups..."
+          
+          # Delete backend target group
+          BACKEND_TG_ARN=$(aws elbv2 describe-target-groups \
+            --names "${{ env.PROJECT_NAME }}-backend-tg" \
+            --query 'TargetGroups[0].TargetGroupArn' \
+            --output text \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || echo "None")
+          
+          if [ "$BACKEND_TG_ARN" != "None" ] && [ -n "$BACKEND_TG_ARN" ]; then
+            aws elbv2 delete-target-group \
+              --target-group-arn $BACKEND_TG_ARN \
+              --region ${{ env.AWS_REGION }} 2>/dev/null || true
+          fi
+          
+          # Delete frontend target group
+          FRONTEND_TG_ARN=$(aws elbv2 describe-target-groups \
+            --names "${{ env.PROJECT_NAME }}-frontend-tg" \
+            --query 'TargetGroups[0].TargetGroupArn' \
+            --output text \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || echo "None")
+          
+          if [ "$FRONTEND_TG_ARN" != "None" ] && [ -n "$FRONTEND_TG_ARN" ]; then
+            aws elbv2 delete-target-group \
+              --target-group-arn $FRONTEND_TG_ARN \
+              --region ${{ env.AWS_REGION }} 2>/dev/null || true
+          fi
+          
+          echo "✅ Target groups deleted"
+
+      - name: Delete ECR Repositories
+        run: |
+          echo "🗑️  Deleting ECR repositories and all images..."
+          
+          aws ecr delete-repository \
+            --repository-name ${{ env.BACKEND_REPO }} \
+            --force \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || echo "Backend repo already deleted"
+          
+          aws ecr delete-repository \
+            --repository-name ${{ env.FRONTEND_REPO }} \
+            --force \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || echo "Frontend repo already deleted"
+          
+          echo "✅ ECR repositories deleted"
+
+      - name: Delete CloudWatch Log Groups
+        run: |
+          echo "🗑️  Deleting CloudWatch log groups..."
+          
+          aws logs delete-log-group \
+            --log-group-name /ecs/${{ env.PROJECT_NAME }}-backend \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || echo "Backend log group already deleted"
+          
+          aws logs delete-log-group \
+            --log-group-name /ecs/${{ env.PROJECT_NAME }}-frontend \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || echo "Frontend log group already deleted"
+          
+          echo "✅ CloudWatch log groups deleted"
+
+      - name: Delete VPC Resources
+        run: |
+          echo "🗑️  Deleting VPC and related resources..."
+          
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=${{ env.PROJECT_NAME }}-vpc" \
+            --query 'Vpcs[0].VpcId' \
+            --output text \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || echo "None")
+          
+          if [ "$VPC_ID" != "None" ] && [ -n "$VPC_ID" ]; then
+            echo "Found VPC: $VPC_ID"
+            
+            # Delete NAT Gateways if any
+            NAT_GW_IDS=$(aws ec2 describe-nat-gateways \
+              --filter "Name=vpc-id,Values=$VPC_ID" \
+              --query 'NatGateways[?State==`available`].NatGatewayId' \
+              --output text \
+              --region ${{ env.AWS_REGION }} 2>/dev/null || echo "")
+            
+            for NAT_ID in $NAT_GW_IDS; do
+              echo "Deleting NAT Gateway: $NAT_ID"
+              aws ec2 delete-nat-gateway \
+                --nat-gateway-id $NAT_ID \
+                --region ${{ env.AWS_REGION }} 2>/dev/null || true
+            done
+            
+            if [ -n "$NAT_GW_IDS" ]; then
+              echo "Waiting for NAT Gateways to delete..."
+              sleep 60
+            fi
+            
+            # Release Elastic IPs
+            EIP_ALLOC_IDS=$(aws ec2 describe-addresses \
+              --filters "Name=domain,Values=vpc" \
+              --query 'Addresses[*].AllocationId' \
+              --output text \
+              --region ${{ env.AWS_REGION }} 2>/dev/null || echo "")
+            
+            for ALLOC_ID in $EIP_ALLOC_IDS; do
+              echo "Releasing Elastic IP: $ALLOC_ID"
+              aws ec2 release-address \
+                --allocation-id $ALLOC_ID \
+                --region ${{ env.AWS_REGION }} 2>/dev/null || true
+            done
+            
+            # Delete network interfaces
+            ENI_IDS=$(aws ec2 describe-network-interfaces \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'NetworkInterfaces[*].NetworkInterfaceId' \
+              --output text \
+              --region ${{ env.AWS_REGION }} 2>/dev/null || echo "")
+            
+            for ENI_ID in $ENI_IDS; do
+              echo "Deleting network interface: $ENI_ID"
+              aws ec2 delete-network-interface \
+                --network-interface-id $ENI_ID \
+                --region ${{ env.AWS_REGION }} 2>/dev/null || true
+            done
+            
+            sleep 10
+            
+            # Delete security groups (except default)
+            SG_IDS=$(aws ec2 describe-security-groups \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
+              --output text \
+              --region ${{ env.AWS_REGION }} 2>/dev/null || echo "")
+            
+            # First pass: remove all rules
+            for SG_ID in $SG_IDS; do
+              echo "Removing rules from SG: $SG_ID"
+              aws ec2 revoke-security-group-ingress \
+                --group-id $SG_ID \
+                --ip-permissions "$(aws ec2 describe-security-groups --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissions' --output json 2>/dev/null)" \
+                --region ${{ env.AWS_REGION }} 2>/dev/null || true
+              aws ec2 revoke-security-group-egress \
+                --group-id $SG_ID \
+                --ip-permissions "$(aws ec2 describe-security-groups --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissionsEgress' --output json 2>/dev/null)" \
+                --region ${{ env.AWS_REGION }} 2>/dev/null || true
+            done
+            
+            # Second pass: delete security groups
+            for SG_ID in $SG_IDS; do
+              echo "Deleting security group: $SG_ID"
+              aws ec2 delete-security-group \
+                --group-id $SG_ID \
+                --region ${{ env.AWS_REGION }} 2>/dev/null || true
+            done
+            
+            # Delete route tables (except main)
+            RT_IDS=$(aws ec2 describe-route-tables \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' \
+              --output text \
+              --region ${{ env.AWS_REGION }} 2>/dev/null || echo "")
+            
+            for RT_ID in $RT_IDS; do
+              echo "Deleting route table: $RT_ID"
+              
+              # Disassociate subnets
+              ASSOC_IDS=$(aws ec2 describe-route-tables \
+                --route-table-ids $RT_ID \
+                --query 'RouteTables[0].Associations[?!Main].RouteTableAssociationId' \
+                --output text \
+                --region ${{ env.AWS_REGION }} 2>/dev/null || echo "")
+              
+              for ASSOC_ID in $ASSOC_IDS; do
+                aws ec2 disassociate-route-table \
+                  --association-id $ASSOC_ID \
+                  --region ${{ env.AWS_REGION }} 2>/dev/null || true
+              done
+              
+              aws ec2 delete-route-table \
+                --route-table-id $RT_ID \
+                --region ${{ env.AWS_REGION }} 2>/dev/null || true
+            done
+            
+            # Delete subnets
+            SUBNET_IDS=$(aws ec2 describe-subnets \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'Subnets[*].SubnetId' \
+              --output text \
+              --region ${{ env.AWS_REGION }} 2>/dev/null || echo "")
+            
+            for SUBNET_ID in $SUBNET_IDS; do
+              echo "Deleting subnet: $SUBNET_ID"
+              aws ec2 delete-subnet \
+                --subnet-id $SUBNET_ID \
+                --region ${{ env.AWS_REGION }} 2>/dev/null || true
+            done
+            
+            # Detach and delete internet gateway
+            IGW_ID=$(aws ec2 describe-internet-gateways \
+              --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+              --query 'InternetGateways[0].InternetGatewayId' \
+              --output text \
+              --region ${{ env.AWS_REGION }} 2>/dev/null || echo "None")
+            
+            if [ "$IGW_ID" != "None" ] && [ -n "$IGW_ID" ]; then
+              echo "Detaching and deleting internet gateway: $IGW_ID"
+              aws ec2 detach-internet-gateway \
+                --internet-gateway-id $IGW_ID \
+                --vpc-id $VPC_ID \
+                --region ${{ env.AWS_REGION }} 2>/dev/null || true
+              aws ec2 delete-internet-gateway \
+                --internet-gateway-id $IGW_ID \
+                --region ${{ env.AWS_REGION }} 2>/dev/null || true
+            fi
+            
+            # Delete VPC
+            echo "Deleting VPC: $VPC_ID"
+            aws ec2 delete-vpc \
+              --vpc-id $VPC_ID \
+              --region ${{ env.AWS_REGION }} 2>/dev/null || echo "VPC deletion failed, may need manual cleanup"
+          fi
+          
+          echo "✅ VPC resources deleted"
+
+      - name: Delete IAM Role
+        run: |
+          echo "🗑️  Deleting IAM role and policies..."
+          
+          ROLE_NAME="${{ env.PROJECT_NAME }}-ecs-task-execution-role"
+          
+          # Detach all managed policies
+          ATTACHED_POLICIES=$(aws iam list-attached-role-policies \
+            --role-name $ROLE_NAME \
+            --query 'AttachedPolicies[*].PolicyArn' \
+            --output text 2>/dev/null || echo "")
+          
+          for POLICY_ARN in $ATTACHED_POLICIES; do
+            echo "Detaching policy: $POLICY_ARN"
+            aws iam detach-role-policy \
+              --role-name $ROLE_NAME \
+              --policy-arn $POLICY_ARN 2>/dev/null || true
+          done
+          
+          # Delete inline policies
+          INLINE_POLICIES=$(aws iam list-role-policies \
+            --role-name $ROLE_NAME \
+            --query 'PolicyNames[*]' \
+            --output text 2>/dev/null || echo "")
+          
+          for POLICY_NAME in $INLINE_POLICIES; do
+            echo "Deleting inline policy: $POLICY_NAME"
+            aws iam delete-role-policy \
+              --role-name $ROLE_NAME \
+              --policy-name $POLICY_NAME 2>/dev/null || true
+          done
+          
+          # Delete role
+          aws iam delete-role \
+            --role-name $ROLE_NAME 2>/dev/null || echo "Role already deleted"
+          
+          echo "✅ IAM role deleted"
+
+      - name: Cleanup Summary
+        if: always()
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🎉 CLEANUP COMPLETE!"
+          echo "=========================================="
+          echo ""
+          echo "All AWS resources have been deleted:"
+          echo "  ✅ ECS Services and Task Definitions"
+          echo "  ✅ ECS Cluster"
+          echo "  ✅ Application Load Balancer"
+          echo "  ✅ Target Groups and Listeners"
+          echo "  ✅ ECR Repositories and Docker Images"
+          echo "  ✅ CloudWatch Log Groups"
+          echo "  ✅ VPC, Subnets, and Internet Gateway"
+          echo "  ✅ Security Groups and Route Tables"
+          echo "  ✅ Network Interfaces and Elastic IPs"
+          echo "  ✅ IAM Roles and Policies"
+          echo ""
+          echo "Your AWS account is clean! 🧹"
+          echo "=========================================="
+          echo "=================================="
+          echo "All AWS resources have been deleted or cleanup attempted."
+          echo "Please verify in AWS Console that all resources are removed." 

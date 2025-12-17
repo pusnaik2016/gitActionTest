@@ -1,0 +1,431 @@
+name: DEPLOY APP TO AWS ECS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:  # Add manual trigger
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_NAME: campus-events
+  ECR_BACKEND_REPO: campus-events-backend
+  ECR_FRONTEND_REPO: campus-events-frontend
+  ECS_CLUSTER: campus-events-cluster
+  BACKEND_SERVICE: campus-events-backend-service
+  FRONTEND_SERVICE: campus-events-frontend-service
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Account ID
+        id: aws-account
+        run: |
+          echo "account_id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+
+      - name: Create VPC
+        id: vpc
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=${PROJECT_NAME}-vpc" --query 'Vpcs[0].VpcId' --output text)
+          if [ "$VPC_ID" = "None" ] || [ -z "$VPC_ID" ]; then
+            echo "Creating VPC..."
+            VPC_ID=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${PROJECT_NAME}-vpc}]" --query 'Vpc.VpcId' --output text)
+            aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-support
+            aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames
+            sleep 5
+          fi
+          echo "vpc_id=$VPC_ID" >> $GITHUB_OUTPUT
+          echo "VPC ID: $VPC_ID"
+
+      - name: Create Internet Gateway
+        id: igw
+        run: |
+          VPC_ID="${{ steps.vpc.outputs.vpc_id }}"
+          IGW_ID=$(aws ec2 describe-internet-gateways --filters "Name=tag:Name,Values=${PROJECT_NAME}-igw" --query 'InternetGateways[0].InternetGatewayId' --output text)
+          if [ "$IGW_ID" = "None" ] || [ -z "$IGW_ID" ]; then
+            echo "Creating Internet Gateway..."
+            IGW_ID=$(aws ec2 create-internet-gateway --tag-specifications "ResourceType=internet-gateway,Tags=[{Key=Name,Value=${PROJECT_NAME}-igw}]" --query 'InternetGateway.InternetGatewayId' --output text)
+            aws ec2 attach-internet-gateway --vpc-id $VPC_ID --internet-gateway-id $IGW_ID
+            sleep 3
+          fi
+          echo "igw_id=$IGW_ID" >> $GITHUB_OUTPUT
+
+      - name: Create Subnets
+        id: subnets
+        run: |
+          VPC_ID="${{ steps.vpc.outputs.vpc_id }}"
+          AZ1=$(aws ec2 describe-availability-zones --query 'AvailabilityZones[0].ZoneName' --output text)
+          AZ2=$(aws ec2 describe-availability-zones --query 'AvailabilityZones[1].ZoneName' --output text)
+          
+          SUBNET1_ID=$(aws ec2 describe-subnets --filters "Name=tag:Name,Values=${PROJECT_NAME}-public-subnet-1" --query 'Subnets[0].SubnetId' --output text)
+          if [ "$SUBNET1_ID" = "None" ] || [ -z "$SUBNET1_ID" ]; then
+            SUBNET1_ID=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.1.0/24 --availability-zone $AZ1 --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${PROJECT_NAME}-public-subnet-1}]" --query 'Subnet.SubnetId' --output text)
+            aws ec2 modify-subnet-attribute --subnet-id $SUBNET1_ID --map-public-ip-on-launch
+          fi
+          
+          SUBNET2_ID=$(aws ec2 describe-subnets --filters "Name=tag:Name,Values=${PROJECT_NAME}-public-subnet-2" --query 'Subnets[0].SubnetId' --output text)
+          if [ "$SUBNET2_ID" = "None" ] || [ -z "$SUBNET2_ID" ]; then
+            SUBNET2_ID=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.2.0/24 --availability-zone $AZ2 --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${PROJECT_NAME}-public-subnet-2}]" --query 'Subnet.SubnetId' --output text)
+            aws ec2 modify-subnet-attribute --subnet-id $SUBNET2_ID --map-public-ip-on-launch
+          fi
+          
+          echo "subnet1_id=$SUBNET1_ID" >> $GITHUB_OUTPUT
+          echo "subnet2_id=$SUBNET2_ID" >> $GITHUB_OUTPUT
+
+      - name: Create Route Table
+        run: |
+          VPC_ID="${{ steps.vpc.outputs.vpc_id }}"
+          IGW_ID="${{ steps.igw.outputs.igw_id }}"
+          SUBNET1_ID="${{ steps.subnets.outputs.subnet1_id }}"
+          SUBNET2_ID="${{ steps.subnets.outputs.subnet2_id }}"
+          
+          RT_ID=$(aws ec2 describe-route-tables --filters "Name=tag:Name,Values=${PROJECT_NAME}-public-rt" --query 'RouteTables[0].RouteTableId' --output text)
+          if [ "$RT_ID" = "None" ] || [ -z "$RT_ID" ]; then
+            RT_ID=$(aws ec2 create-route-table --vpc-id $VPC_ID --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value=${PROJECT_NAME}-public-rt}]" --query 'RouteTable.RouteTableId' --output text)
+            aws ec2 create-route --route-table-id $RT_ID --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID || true
+            aws ec2 associate-route-table --route-table-id $RT_ID --subnet-id $SUBNET1_ID || true
+            aws ec2 associate-route-table --route-table-id $RT_ID --subnet-id $SUBNET2_ID || true
+          fi
+
+      - name: Create Security Groups
+        id: sg
+        run: |
+          VPC_ID="${{ steps.vpc.outputs.vpc_id }}"
+          
+          ALB_SG_ID=$(aws ec2 describe-security-groups --filters "Name=tag:Name,Values=${PROJECT_NAME}-alb-sg" "Name=vpc-id,Values=$VPC_ID" --query 'SecurityGroups[0].GroupId' --output text)
+          if [ "$ALB_SG_ID" = "None" ] || [ -z "$ALB_SG_ID" ]; then
+            ALB_SG_ID=$(aws ec2 create-security-group --group-name "${PROJECT_NAME}-alb-sg" --description "ALB SG" --vpc-id $VPC_ID --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=${PROJECT_NAME}-alb-sg}]" --query 'GroupId' --output text)
+            aws ec2 authorize-security-group-ingress --group-id $ALB_SG_ID --protocol tcp --port 80 --cidr 0.0.0.0/0 || true
+            aws ec2 authorize-security-group-ingress --group-id $ALB_SG_ID --protocol tcp --port 3000 --cidr 0.0.0.0/0 || true
+          fi
+          
+          BACKEND_SG_ID=$(aws ec2 describe-security-groups --filters "Name=tag:Name,Values=${PROJECT_NAME}-backend-sg" "Name=vpc-id,Values=$VPC_ID" --query 'SecurityGroups[0].GroupId' --output text)
+          if [ "$BACKEND_SG_ID" = "None" ] || [ -z "$BACKEND_SG_ID" ]; then
+            BACKEND_SG_ID=$(aws ec2 create-security-group --group-name "${PROJECT_NAME}-backend-sg" --description "Backend SG" --vpc-id $VPC_ID --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=${PROJECT_NAME}-backend-sg}]" --query 'GroupId' --output text)
+          fi
+          # Always ensure ingress and egress rules exist (idempotent)
+          aws ec2 authorize-security-group-ingress --group-id $BACKEND_SG_ID --protocol tcp --port 3000 --source-group $ALB_SG_ID 2>/dev/null || true
+          aws ec2 authorize-security-group-egress --group-id $BACKEND_SG_ID --protocol -1 --cidr 0.0.0.0/0 2>/dev/null || true
+          
+          FRONTEND_SG_ID=$(aws ec2 describe-security-groups --filters "Name=tag:Name,Values=${PROJECT_NAME}-frontend-sg" "Name=vpc-id,Values=$VPC_ID" --query 'SecurityGroups[0].GroupId' --output text)
+          if [ "$FRONTEND_SG_ID" = "None" ] || [ -z "$FRONTEND_SG_ID" ]; then
+            FRONTEND_SG_ID=$(aws ec2 create-security-group --group-name "${PROJECT_NAME}-frontend-sg" --description "Frontend SG" --vpc-id $VPC_ID --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=${PROJECT_NAME}-frontend-sg}]" --query 'GroupId' --output text)
+          fi
+          # Always ensure ingress and egress rules exist (idempotent)
+          aws ec2 authorize-security-group-ingress --group-id $FRONTEND_SG_ID --protocol tcp --port 80 --source-group $ALB_SG_ID 2>/dev/null || true
+          aws ec2 authorize-security-group-egress --group-id $FRONTEND_SG_ID --protocol -1 --cidr 0.0.0.0/0 2>/dev/null || true
+          
+          echo "alb_sg_id=$ALB_SG_ID" >> $GITHUB_OUTPUT
+          echo "backend_sg_id=$BACKEND_SG_ID" >> $GITHUB_OUTPUT
+          echo "frontend_sg_id=$FRONTEND_SG_ID" >> $GITHUB_OUTPUT
+
+      - name: Create Application Load Balancer
+        id: alb
+        run: |
+          SUBNET1_ID="${{ steps.subnets.outputs.subnet1_id }}"
+          SUBNET2_ID="${{ steps.subnets.outputs.subnet2_id }}"
+          ALB_SG_ID="${{ steps.sg.outputs.alb_sg_id }}"
+          
+          ALB_ARN=$(aws elbv2 describe-load-balancers --names "${PROJECT_NAME}-alb" --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || echo "None")
+          if [ "$ALB_ARN" = "None" ] || [ -z "$ALB_ARN" ]; then
+            echo "Creating ALB..."
+            ALB_ARN=$(aws elbv2 create-load-balancer --name "${PROJECT_NAME}-alb" --subnets $SUBNET1_ID $SUBNET2_ID --security-groups $ALB_SG_ID --scheme internet-facing --type application --tags Key=Name,Value=${PROJECT_NAME}-alb --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+            sleep 60
+          fi
+          
+          ALB_DNS=$(aws elbv2 describe-load-balancers --load-balancer-arns $ALB_ARN --query 'LoadBalancers[0].DNSName' --output text)
+          echo "alb_arn=$ALB_ARN" >> $GITHUB_OUTPUT
+          echo "alb_dns=$ALB_DNS" >> $GITHUB_OUTPUT
+          echo "ALB DNS: $ALB_DNS"
+
+      - name: Create Target Groups
+        id: tg
+        run: |
+          VPC_ID="${{ steps.vpc.outputs.vpc_id }}"
+          
+          BACKEND_TG_ARN=$(aws elbv2 describe-target-groups --names "${PROJECT_NAME}-backend-tg" --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "None")
+          if [ "$BACKEND_TG_ARN" = "None" ] || [ -z "$BACKEND_TG_ARN" ]; then
+            BACKEND_TG_ARN=$(aws elbv2 create-target-group --name "${PROJECT_NAME}-backend-tg" --protocol HTTP --port 3000 --vpc-id $VPC_ID --target-type ip --health-check-path /health --health-check-interval-seconds 30 --health-check-timeout-seconds 5 --healthy-threshold-count 2 --unhealthy-threshold-count 3 --query 'TargetGroups[0].TargetGroupArn' --output text)
+          fi
+          
+          FRONTEND_TG_ARN=$(aws elbv2 describe-target-groups --names "${PROJECT_NAME}-frontend-tg" --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "None")
+          if [ "$FRONTEND_TG_ARN" = "None" ] || [ -z "$FRONTEND_TG_ARN" ]; then
+            FRONTEND_TG_ARN=$(aws elbv2 create-target-group --name "${PROJECT_NAME}-frontend-tg" --protocol HTTP --port 80 --vpc-id $VPC_ID --target-type ip --health-check-path / --health-check-interval-seconds 30 --health-check-timeout-seconds 5 --healthy-threshold-count 2 --unhealthy-threshold-count 3 --query 'TargetGroups[0].TargetGroupArn' --output text)
+          fi
+          
+          echo "backend_tg_arn=$BACKEND_TG_ARN" >> $GITHUB_OUTPUT
+          echo "frontend_tg_arn=$FRONTEND_TG_ARN" >> $GITHUB_OUTPUT
+
+      - name: Create ALB Listeners
+        run: |
+          ALB_ARN="${{ steps.alb.outputs.alb_arn }}"
+          BACKEND_TG_ARN="${{ steps.tg.outputs.backend_tg_arn }}"
+          FRONTEND_TG_ARN="${{ steps.tg.outputs.frontend_tg_arn }}"
+          
+          FRONTEND_LISTENER=$(aws elbv2 describe-listeners --load-balancer-arn $ALB_ARN --query "Listeners[?Port==\`80\`].ListenerArn" --output text)
+          if [ -z "$FRONTEND_LISTENER" ]; then
+            aws elbv2 create-listener --load-balancer-arn $ALB_ARN --protocol HTTP --port 80 --default-actions Type=forward,TargetGroupArn=$FRONTEND_TG_ARN
+          fi
+          
+          BACKEND_LISTENER=$(aws elbv2 describe-listeners --load-balancer-arn $ALB_ARN --query "Listeners[?Port==\`3000\`].ListenerArn" --output text)
+          if [ -z "$BACKEND_LISTENER" ]; then
+            aws elbv2 create-listener --load-balancer-arn $ALB_ARN --protocol HTTP --port 3000 --default-actions Type=forward,TargetGroupArn=$BACKEND_TG_ARN
+          fi
+
+      - name: Create ECR Repositories
+        run: |
+          aws ecr describe-repositories --repository-names $ECR_BACKEND_REPO 2>/dev/null || aws ecr create-repository --repository-name $ECR_BACKEND_REPO
+          aws ecr describe-repositories --repository-names $ECR_FRONTEND_REPO 2>/dev/null || aws ecr create-repository --repository-name $ECR_FRONTEND_REPO
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push Backend Docker Image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          cd backend
+          docker build -t $ECR_REGISTRY/$ECR_BACKEND_REPO:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_BACKEND_REPO:$IMAGE_TAG $ECR_REGISTRY/$ECR_BACKEND_REPO:latest
+          docker push $ECR_REGISTRY/$ECR_BACKEND_REPO:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_BACKEND_REPO:latest
+
+      - name: Build and Push Frontend Docker Image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          VITE_API_URL: http://${{ steps.alb.outputs.alb_dns }}:3000
+        run: |
+          cd frontend
+          docker build --build-arg VITE_API_URL=$VITE_API_URL -t $ECR_REGISTRY/$ECR_FRONTEND_REPO:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_FRONTEND_REPO:$IMAGE_TAG $ECR_REGISTRY/$ECR_FRONTEND_REPO:latest
+          docker push $ECR_REGISTRY/$ECR_FRONTEND_REPO:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_FRONTEND_REPO:latest
+
+      - name: Create ECS Cluster
+        run: |
+          CLUSTER_STATUS=$(aws ecs describe-clusters --clusters $ECS_CLUSTER --query 'clusters[0].status' --output text 2>/dev/null || echo "NONE")
+          if [ "$CLUSTER_STATUS" != "ACTIVE" ]; then
+            echo "Creating ECS Cluster..."
+            aws ecs create-cluster --cluster-name $ECS_CLUSTER
+            echo "Cluster created successfully"
+          else
+            echo "Cluster already exists and is active"
+          fi
+
+      - name: Create CloudWatch Log Groups
+        run: |
+          aws logs create-log-group --log-group-name /ecs/${PROJECT_NAME}-backend 2>/dev/null || true
+          aws logs create-log-group --log-group-name /ecs/${PROJECT_NAME}-frontend 2>/dev/null || true
+          aws logs put-retention-policy --log-group-name /ecs/${PROJECT_NAME}-backend --retention-in-days 7 || true
+          aws logs put-retention-policy --log-group-name /ecs/${PROJECT_NAME}-frontend --retention-in-days 7 || true
+
+      - name: Create ECS Task Execution Role
+        id: task-role
+        run: |
+          ROLE_NAME="${PROJECT_NAME}-ecs-task-execution-role"
+          ROLE_ARN=$(aws iam get-role --role-name $ROLE_NAME --query 'Role.Arn' --output text 2>/dev/null || echo "None")
+          if [ "$ROLE_ARN" = "None" ] || [ -z "$ROLE_ARN" ]; then
+            cat > trust-policy.json <<EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Principal": {"Service": "ecs-tasks.amazonaws.com"},
+              "Action": "sts:AssumeRole"
+            }]
+          }
+          EOF
+            ROLE_ARN=$(aws iam create-role --role-name $ROLE_NAME --assume-role-policy-document file://trust-policy.json --query 'Role.Arn' --output text)
+            aws iam attach-role-policy --role-name $ROLE_NAME --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+            sleep 10
+          fi
+          echo "role_arn=$ROLE_ARN" >> $GITHUB_OUTPUT
+
+      - name: Register Backend Task Definition
+        id: backend-task
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          TASK_ROLE_ARN="${{ steps.task-role.outputs.role_arn }}"
+          cat > backend-task-def.json <<EOF
+          {
+            "family": "${PROJECT_NAME}-backend-task",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "256",
+            "memory": "512",
+            "executionRoleArn": "$TASK_ROLE_ARN",
+            "containerDefinitions": [{
+              "name": "backend",
+              "image": "$ECR_REGISTRY/$ECR_BACKEND_REPO:latest",
+              "portMappings": [{"containerPort": 3000, "protocol": "tcp"}],
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "/ecs/${PROJECT_NAME}-backend",
+                  "awslogs-region": "$AWS_REGION",
+                  "awslogs-stream-prefix": "ecs"
+                }
+              }
+            }]
+          }
+          EOF
+          TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://backend-task-def.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "task_def_arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+
+      - name: Register Frontend Task Definition
+        id: frontend-task
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          TASK_ROLE_ARN="${{ steps.task-role.outputs.role_arn }}"
+          ALB_DNS="${{ steps.alb.outputs.alb_dns }}"
+          cat > frontend-task-def.json <<EOF
+          {
+            "family": "${PROJECT_NAME}-frontend-task",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "256",
+            "memory": "512",
+            "executionRoleArn": "$TASK_ROLE_ARN",
+            "containerDefinitions": [{
+              "name": "frontend",
+              "image": "$ECR_REGISTRY/$ECR_FRONTEND_REPO:latest",
+              "portMappings": [{"containerPort": 80, "protocol": "tcp"}],
+              "environment": [{"name": "VITE_API_URL", "value": "http://$ALB_DNS:3000"}],
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "/ecs/${PROJECT_NAME}-frontend",
+                  "awslogs-region": "$AWS_REGION",
+                  "awslogs-stream-prefix": "ecs"
+                }
+              }
+            }]
+          }
+          EOF
+          TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://frontend-task-def.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "task_def_arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+
+      - name: Create or Update Backend ECS Service
+        run: |
+          SUBNET1_ID="${{ steps.subnets.outputs.subnet1_id }}"
+          SUBNET2_ID="${{ steps.subnets.outputs.subnet2_id }}"
+          BACKEND_SG_ID="${{ steps.sg.outputs.backend_sg_id }}"
+          BACKEND_TG_ARN="${{ steps.tg.outputs.backend_tg_arn }}"
+          BACKEND_TASK_ARN="${{ steps.backend-task.outputs.task_def_arn }}"
+          
+          SERVICE_EXISTS=$(aws ecs describe-services --cluster $ECS_CLUSTER --services $BACKEND_SERVICE --query 'services[0].serviceName' --output text 2>/dev/null || echo "None")
+          if [ "$SERVICE_EXISTS" = "None" ] || [ -z "$SERVICE_EXISTS" ]; then
+            aws ecs create-service --cluster $ECS_CLUSTER --service-name $BACKEND_SERVICE --task-definition $BACKEND_TASK_ARN --desired-count 1 --launch-type FARGATE --network-configuration "awsvpcConfiguration={subnets=[$SUBNET1_ID,$SUBNET2_ID],securityGroups=[$BACKEND_SG_ID],assignPublicIp=ENABLED}" --load-balancers "targetGroupArn=$BACKEND_TG_ARN,containerName=backend,containerPort=3000" --health-check-grace-period-seconds 60
+          else
+            aws ecs update-service --cluster $ECS_CLUSTER --service $BACKEND_SERVICE --task-definition $BACKEND_TASK_ARN --force-new-deployment
+          fi
+
+      - name: Create or Update Frontend ECS Service
+        run: |
+          SUBNET1_ID="${{ steps.subnets.outputs.subnet1_id }}"
+          SUBNET2_ID="${{ steps.subnets.outputs.subnet2_id }}"
+          FRONTEND_SG_ID="${{ steps.sg.outputs.frontend_sg_id }}"
+          FRONTEND_TG_ARN="${{ steps.tg.outputs.frontend_tg_arn }}"
+          FRONTEND_TASK_ARN="${{ steps.frontend-task.outputs.task_def_arn }}"
+          
+          SERVICE_EXISTS=$(aws ecs describe-services --cluster $ECS_CLUSTER --services $FRONTEND_SERVICE --query 'services[0].serviceName' --output text 2>/dev/null || echo "None")
+          if [ "$SERVICE_EXISTS" = "None" ] || [ -z "$SERVICE_EXISTS" ]; then
+            aws ecs create-service --cluster $ECS_CLUSTER --service-name $FRONTEND_SERVICE --task-definition $FRONTEND_TASK_ARN --desired-count 1 --launch-type FARGATE --network-configuration "awsvpcConfiguration={subnets=[$SUBNET1_ID,$SUBNET2_ID],securityGroups=[$FRONTEND_SG_ID],assignPublicIp=ENABLED}" --load-balancers "targetGroupArn=$FRONTEND_TG_ARN,containerName=frontend,containerPort=80" --health-check-grace-period-seconds 60
+          else
+            aws ecs update-service --cluster $ECS_CLUSTER --service $FRONTEND_SERVICE --task-definition $FRONTEND_TASK_ARN --force-new-deployment
+          fi
+
+      - name: Check Service Status
+        run: |
+          echo "=================================================="
+          echo "Checking initial deployment status..."
+          echo "=================================================="
+          echo ""
+          echo "Backend Service:"
+          aws ecs describe-services --cluster $ECS_CLUSTER --services $BACKEND_SERVICE --query 'services[0].{Status:status,Running:runningCount,Desired:desiredCount,Events:events[0:3]}' --output json
+          echo ""
+          echo "Frontend Service:"
+          aws ecs describe-services --cluster $ECS_CLUSTER --services $FRONTEND_SERVICE --query 'services[0].{Status:status,Running:runningCount,Desired:desiredCount,Events:events[0:3]}' --output json
+          echo ""
+          echo "Target Group Health:"
+          echo "Backend TG:"
+          aws elbv2 describe-target-health --target-group-arn "${{ steps.tg.outputs.backend_tg_arn }}" || echo "No targets registered yet"
+          echo ""
+          echo "Frontend TG:"
+          aws elbv2 describe-target-health --target-group-arn "${{ steps.tg.outputs.frontend_tg_arn }}" || echo "No targets registered yet"
+          echo ""
+          echo "=================================================="
+
+      - name: Wait for Services to be Stable
+        run: |
+          echo "Waiting for services to stabilize (timeout: 10 minutes)..."
+          echo "This may take a few minutes as tasks start and pass health checks..."
+          
+          # Wait with timeout handling
+          timeout 600 aws ecs wait services-stable --cluster $ECS_CLUSTER --services $BACKEND_SERVICE $FRONTEND_SERVICE || {
+            echo ""
+            echo "⚠️  Service stabilization timed out or failed. Checking current status..."
+            echo ""
+            echo "Backend Service Status:"
+            aws ecs describe-services --cluster $ECS_CLUSTER --services $BACKEND_SERVICE --query 'services[0].events[0:5]' --output json
+            echo ""
+            echo "Frontend Service Status:"
+            aws ecs describe-services --cluster $ECS_CLUSTER --services $FRONTEND_SERVICE --query 'services[0].events[0:5]' --output json
+            echo ""
+            echo "Backend Tasks:"
+            BACKEND_TASKS=$(aws ecs list-tasks --cluster $ECS_CLUSTER --service-name $BACKEND_SERVICE --query 'taskArns[0]' --output text)
+            if [ ! -z "$BACKEND_TASKS" ] && [ "$BACKEND_TASKS" != "None" ]; then
+              aws ecs describe-tasks --cluster $ECS_CLUSTER --tasks $BACKEND_TASKS --query 'tasks[0].{LastStatus:lastStatus,HealthStatus:healthStatus,StopCode:stopCode,StoppedReason:stoppedReason}' --output json
+            fi
+            echo ""
+            echo "Frontend Tasks:"
+            FRONTEND_TASKS=$(aws ecs list-tasks --cluster $ECS_CLUSTER --service-name $FRONTEND_SERVICE --query 'taskArns[0]' --output text)
+            if [ ! -z "$FRONTEND_TASKS" ] && [ "$FRONTEND_TASKS" != "None" ]; then
+              aws ecs describe-tasks --cluster $ECS_CLUSTER --tasks $FRONTEND_TASKS --query 'tasks[0].{LastStatus:lastStatus,HealthStatus:healthStatus,StopCode:stopCode,StoppedReason:stoppedReason}' --output json
+            fi
+            exit 1
+          }
+
+      - name: Verify Deployment
+        run: |
+          echo "Verifying target health..."
+          echo ""
+          echo "Backend Target Health:"
+          aws elbv2 describe-target-health --target-group-arn "${{ steps.tg.outputs.backend_tg_arn }}"
+          echo ""
+          echo "Frontend Target Health:"
+          aws elbv2 describe-target-health --target-group-arn "${{ steps.tg.outputs.frontend_tg_arn }}"
+
+      - name: Display Application URLs
+        run: |
+          ALB_DNS="${{ steps.alb.outputs.alb_dns }}"
+          echo ""
+          echo "=================================================="
+          echo "🚀 DEPLOYMENT SUCCESSFUL!"
+          echo "=================================================="
+          echo ""
+          echo "📱 Frontend URL: http://$ALB_DNS"
+          echo "🔧 Backend API URL: http://$ALB_DNS:3000"
+          echo "❤️  Backend Health: http://$ALB_DNS:3000/health"
+          echo ""
+          echo "Note: It may take 1-2 minutes for the ALB to route"
+          echo "traffic to healthy targets after deployment."
+          echo ""
+          echo "=================================================="
