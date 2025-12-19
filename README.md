@@ -1,10 +1,10 @@
-# 🎓 Campus Event Management System
+# Campus Event Management System
 
-## 🌟 Overview
+## 🎯 Project Overview
 
-Welcome to the Campus Event Management System - a modern, cloud-native web application designed to revolutionize how students discover and engage with campus events. What makes this project truly special isn't just the application itself, but the sophisticated DevOps pipeline that powers it. Imagine pushing your code changes to GitHub and having them automatically deployed to a production-ready AWS infrastructure within minutes - no manual intervention, no complex deployment scripts, just pure automation magic.
+Welcome to the Campus Event Management System - a modern, cloud-native web application designed to revolutionize how students discover and engage with campus events. What makes this project special isn't just the application itself, but the sophisticated DevOps pipeline that powers it. Imagine pushing your code changes to GitHub and having them automatically deployed to a production-ready AWS infrastructure within minutes - no manual intervention, no complex deployment scripts, just pure automation magic.
 
-This project serves as a comprehensive demonstration of modern cloud-native development practices, showcasing how enterprise-grade infrastructure can be managed entirely through code. When you commit changes to the main branch, an orchestrated chain of events begins: GitHub Actions springs into action, provisioning all necessary AWS resources if they don't exist, building optimized Docker containers for both frontend and backend, pushing them to Amazon's Elastic Container Registry, and finally deploying them to ECS Fargate clusters behind a load balancer. The entire journey from code commit to live production takes approximately 10-12 minutes, resulting in a highly available, scalable application that's ready to handle real-world traffic.
+This project serves as a comprehensive demonstration of modern cloud-native development practices, showcasing how enterprise-grade infrastructure can be managed entirely through code. When you commit changes to the main branch, an orchestrated chain of events begins: GitHub Actions springs into action, provisioning all necessary AWS resources if they don't exist, building optimized Docker containers for both frontend and backend, pushing them to Amazon's Elastic Container Registry, and finally deploying them to ECS Fargate clusters behind a load balancer. The entire journey from code commit to live production takes approximately 5-7 minutes max, resulting in a highly available, scalable application that's ready to handle real-world traffic.
 
 ## 🎯 What This Application Does
 
@@ -22,7 +22,7 @@ The frontend is built with React 18 and styled beautifully with Tailwind CSS, of
 
 ## 🚀 Quick Start Guide
 
-Getting your application deployed to AWS is remarkably straightforward. Here's everything you need to do to have a production-ready application running on AWS infrastructure in under 15 minutes:
+Here's everything you need to do to have a production-ready application running on AWS infrastructure in under 15 minutes:
 
 ### Prerequisites
 - **An AWS Account** with appropriate permissions (you'll need access to create ECS, VPC, ALB, ECR, and IAM resources)
@@ -47,23 +47,6 @@ Navigate to your GitHub repository settings, then to "Secrets and variables" →
 - `AWS_ACCESS_KEY_ID` - Your AWS access key
 - `AWS_SECRET_ACCESS_KEY` - Your AWS secret key
 
-**Alternative: Using the Secrets Script**
-
-You can automate setting GitHub secrets using the provided script. Create a `.env` file in the root directory with your secrets:
-
-```
-AWS_ACCESS_KEY_ID=your-access-key
-AWS_SECRET_ACCESS_KEY=your-secret-key
-```
-
-Then run:
-
-```bash
-./scripts/secrets.sh
-```
-
-This requires the GitHub CLI (`gh`) to be installed and authenticated.
-
 **4. Trigger the Deployment**
 
 Simply push any change to the main branch, or manually trigger the workflow:
@@ -75,11 +58,12 @@ That's genuinely all there is to it! GitHub Actions will orchestrate the entire 
 
 ### 🧹 Cleanup Resources
 
-When you're done experimenting or need to tear down all AWS resources to avoid ongoing charges, you can do using GitHub Actions Workflow**
+When you're done experimenting or need to delete all created AWS resources to avoid ongoing charges, you can do using GitHub Actions Workflow**
 ```bash
 gh workflow run cleanup.yml
 ```
 
+This requires the GitHub CLI (`gh`) to be installed and authenticated.
 
 Both methods will systematically delete all created AWS resources including ECS services, clusters, load balancers, target groups, VPC components, security groups, ECR repositories (and all images), CloudWatch log groups, and IAM roles. The process typically completes in 3-5 minutes and leaves your AWS account clean.
 
