@@ -7,7 +7,7 @@ on:
   workflow_dispatch:  # Add manual trigger
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: us-west-1
   PROJECT_NAME: campus-events
   ECR_BACKEND_REPO: campus-events-backend
   ECR_FRONTEND_REPO: campus-events-frontend
