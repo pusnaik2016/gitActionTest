@@ -1,0 +1,95 @@
+name: Test Pipeline
+
+on:
+  push:
+    branches: [ main, master, 'copilot/**' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  test-job:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
+        
+    - name: Display environment info
+      run: |
+        echo "Repository: ${{ github.repository }}"
+        echo "Branch: ${{ github.ref }}"
+        echo "Commit SHA: ${{ github.sha }}"
+        echo "Runner OS: ${{ runner.os }}"
+        
+    - name: Run tests
+      run: |
+        python test_script.py
+        
+    - name: Check script output
+      run: |
+        chmod +x hello.sh
+        ./hello.sh
+        
+  lint-job:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Check file structure
+      run: |
+        echo "Listing repository files:"
+        ls -la
+        
+    - name: Validate workflow files
+      run: |
+        echo "Checking for workflow files..."
+        ls -la .github/workflows/
+        
+  build-job:
+    runs-on: ubuntu-latest
+    needs: [test-job, lint-job]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Create build artifact
+      run: |
+        echo "Building application..."
+        mkdir -p build
+        echo "Build completed at $(date)" > build/build-info.txt
+        
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: build-artifact
+        path: build/
+        
+  deploy-job:
+    runs-on: ubuntu-latest
+    needs: build-job
+    if: github.event_name == 'push'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Download artifact
+      uses: actions/download-artifact@v3
+      with:
+        name: build-artifact
+        path: build/
+        
+    - name: Simulate deployment
+      run: |
+        echo "Deploying application..."
+        cat build/build-info.txt
+        echo "Deployment successful!"
